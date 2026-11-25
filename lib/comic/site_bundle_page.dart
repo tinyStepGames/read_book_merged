@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -741,45 +743,250 @@ class _SiteQrScanner extends StatefulWidget {
   State<_SiteQrScanner> createState() => _SiteQrScannerState();
 }
 
-class _SiteQrScannerState extends State<_SiteQrScanner> {
-  bool _accepted = false;
+class _SiteQrScannerState extends State<_SiteQrScanner>
+    with WidgetsBindingObserver {
+  MobileScannerController? _controller;
+  bool _finished = false;
+  bool _busy = false;
+  String _message =
+      '「サイト一式のJSON・QR」で作成したQRを写してください。\n'
+      '読み取りだけでは通信・保存しません。';
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _controller = MobileScannerController(
+      detectionSpeed: DetectionSpeed.noDuplicates,
+    );
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final controller = _controller;
+
+    if (controller == null || _finished) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      unawaited(controller.stop());
+    } else if (state == AppLifecycleState.resumed) {
+      unawaited(controller.start());
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+
+    final controller = _controller;
+    _controller = null;
+
+    unawaited(controller?.dispose());
+
+    super.dispose();
+  }
+
+  // 読取成功・戻るボタン・iOSスワイプのどれが先に来ても、
+  // このスキャナー自身のルートを一度だけ閉じる。
+  Future<void> _finish(String value) async {
+    if (_finished) {
+      return;
+    }
+
+    _finished = true;
+
+    final controller = _controller;
+    _controller = null;
+
+    try {
+      await controller?.stop();
+    } catch (_) {
+      // 停止に失敗しても閉じる処理は続ける。
+    }
+
+    if (!mounted) {
+      unawaited(controller?.dispose());
+      return;
+    }
+
+    Navigator.of(context).pop(value);
+  }
+
+  void _handleBarcodes(List<Barcode> barcodes) {
+    if (_finished || _busy) {
+      return;
+    }
+
+    var showedUnsupported = false;
+
+    for (final barcode in barcodes) {
+      final value = barcode.rawValue;
+
+      if (value == null) {
+        continue;
+      }
+
+      if (!value.startsWith(SiteRuleBundle.prefix)) {
+        showedUnsupported = true;
+        continue;
+      }
+
+      _showResult(value);
+      return;
+    }
+
+    if (showedUnsupported) {
+      setState(() {
+        _message = '対応しないQRです。\nサイト一式のQRを読み取ってください。';
+      });
+    }
+  }
+
+  void _showResult(String value) {
+    try {
+      // 解析に失敗したら閉じず、理由をこの画面に表示する。
+      SiteRuleBundle.parse(value);
+    } catch (error) {
+      setState(() {
+        _message = 'QRは読めましたが、サイト設定として解析できませんでした。\n'
+            '$error';
+      });
+      return;
+    }
+
+    setState(() => _message = '読み取りました。確認画面へ移動します…');
+    unawaited(_finish(value));
+  }
+
+  Future<void> _scanFromPhoto() async {
+    if (_finished || _busy) {
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _message = '画像を選択してください…';
+    });
+
+    try {
+      final picked = await FilePicker.pickFiles(
+        type: FileType.image,
+      );
+
+      final path = picked?.files.single.path;
+
+      if (path == null) {
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _message = '画像の選択を取り消しました。';
+          });
+        }
+        return;
+      }
+
+      if (mounted) {
+        setState(() => _message = '画像内のQRを解析しています…');
+      }
+
+      final capture = await _controller?.analyzeImage(path);
+
+      if (_finished) {
+        return;
+      }
+
+      final values = capture?.barcodes
+          .map((barcode) => barcode.rawValue)
+          .whereType<String>()
+          .toList();
+
+      for (final value in values ?? const <String>[]) {
+        if (!value.startsWith(SiteRuleBundle.prefix)) {
+          continue;
+        }
+
+        try {
+          SiteRuleBundle.parse(value);
+        } catch (error) {
+          if (mounted) {
+            setState(() {
+              _busy = false;
+              _message = 'QRは読めましたが、サイト設定として解析できませんでした。\n'
+                  '$error';
+            });
+          }
+          return;
+        }
+
+        if (mounted) {
+          setState(() => _message = '読み取りました。確認画面へ移動します…');
+        }
+
+        unawaited(_finish(value));
+        return;
+      }
+
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _message = (values == null || values.isEmpty)
+              ? '画像にQRが見つかりませんでした。'
+              : '画像にサイト一式のQRが見つかりませんでした。';
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _message = '画像の解析に失敗しました。\n$error';
+        });
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('サイト一式のQRを読む')),
+    appBar: AppBar(
+      title: const Text('サイト一式のQRを読む'),
+      actions: [
+        IconButton(
+          tooltip: '写真に保存したQRから読み取る',
+          onPressed: _busy ? null : _scanFromPhoto,
+          icon: const Icon(Icons.photo_library_outlined),
+        ),
+      ],
+    ),
     body: Column(
       children: [
-        const Padding(
-          padding: EdgeInsets.all(16),
-          child: Text(
-            '「サイト一式のJSON・QR」で作成したQRを写してください。'
-            '読み取りだけでは通信・保存しません。',
-          ),
+        Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(_message),
         ),
         Expanded(
-          child: MobileScanner(
-            onDetect: (capture) {
-              if (_accepted) return;
-
-              for (final barcode in capture.barcodes) {
-                final value = barcode.rawValue;
-
-                if (value == null || !value.startsWith(SiteRuleBundle.prefix)) {
-                  continue;
-                }
-
-                _accepted = true;
-
-                // カメライベント中の直接的な画面遷移を避ける。
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (mounted) {
-                    Navigator.pop(context, value);
-                  }
-                });
-
-                break;
-              }
-            },
+          child: Stack(
+            children: [
+              MobileScanner(
+                controller: _controller,
+                onDetect: (capture) => _handleBarcodes(capture.barcodes),
+                errorBuilder: (context, error) => const Center(
+                  child: Text(
+                    'カメラを開けませんでした。\n'
+                    'カメラの使用許可を確認して、\n画面を開き直してください。',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
+              if (_busy)
+                const Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: LinearProgressIndicator(),
+                ),
+            ],
           ),
         ),
       ],
