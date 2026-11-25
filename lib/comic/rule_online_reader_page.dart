@@ -91,6 +91,7 @@ class _RuleOnlineReaderPageState extends State<RuleOnlineReaderPage> {
           cancelToken: cancelToken,
           backgroundMode: true,
           silentMode: true,
+          imageAttribute: widget.site.images?.rule.attribute,
         ),
       ),
     );
@@ -273,6 +274,19 @@ class _RuleOnlineReaderPageState extends State<RuleOnlineReaderPage> {
             fit: StackFit.expand,
             children: [
               const ColoredBox(color: Colors.black),
+              const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 16),
+                    Text(
+                      '画像を準備しています…',
+                      style: TextStyle(color: Colors.white70),
+                    ),
+                  ],
+                ),
+              ),
               if (_waitingControls)
                 const SafeArea(
                   child: Align(

@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'services/html_probe.dart';
 import 'services/rendered_rule_capture.dart';
+import 'services/rendered_image_readiness.dart';
 
 class RenderedRulePage extends StatefulWidget {
   const RenderedRulePage({
@@ -20,6 +21,7 @@ class RenderedRulePage extends StatefulWidget {
     required this.cancelToken,
     this.backgroundMode = false,
     this.silentMode = false,
+    this.imageAttribute,
     this.previewTitle = '',
     this.previewThumbnail,
   });
@@ -30,6 +32,9 @@ class RenderedRulePage extends StatefulWidget {
   final CancelToken cancelToken;
   final bool backgroundMode;
   final bool silentMode;
+
+  /// 本文画像の取得時だけ指定。一覧取得の判定とは分離する。
+  final String? imageAttribute;
   final String previewTitle;
   final Uri? previewThumbnail;
 
@@ -51,6 +56,7 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
   bool _auto = true;
   int _generation = 0;
   int _count = 0;
+  final _imageStability = RenderedImageStability();
   String? _signature;
   DateTime? _stableSince;
   DateTime _started = DateTime.now();
@@ -114,6 +120,7 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
   void _resetWaiting() {
     _signature = null;
     _stableSince = null;
+    _imageStability.reset();
     _count = 0;
     _started = DateTime.now();
   }
@@ -140,9 +147,10 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
 
     try {
       final selector = jsonEncode(widget.groupSelector);
-      final raw = await controller.evaluateJavascript(
-        source:
-            '''
+      final attribute = widget.imageAttribute;
+
+      final source = attribute == null
+          ? '''
 (() => {
   const root = document.documentElement;
   return JSON.stringify({
@@ -152,11 +160,23 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
     size: root ? root.outerHTML.length : 0
   });
 })()
-''',
-      );
+'''
+          : renderedImageReadinessScript(
+              selector: widget.groupSelector,
+              attribute: attribute,
+            );
 
-      if (!mounted || _finished || generation != _generation) return;
-      if (raw is! String || raw.length > 16000) return;
+      final raw = await controller.evaluateJavascript(source: source);
+
+      if (!mounted ||
+          _finished ||
+          generation != _generation ||
+          widget.cancelToken.isCancelled) {
+        return;
+      }
+      if (raw is! String || raw.length > 16000) {
+        throw const FormatException('取得待機の応答を確認できませんでした');
+      }
 
       final data = Map<String, dynamic>.from(jsonDecode(raw) as Map);
       final uri = htmlProbeUri(data['url'] as String);
@@ -164,22 +184,39 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
         throw const FormatException('設定した取得元とは異なるページです');
       }
 
-      final count = data['count'] as int;
       final now = DateTime.now();
-      final signature = '${data['url']}|$count|${data['size']}';
+      final count = data['count'] as int;
       _count = count;
 
-      if (data['ready'] != 'complete' || count == 0) {
-        _signature = null;
-        _stableSince = null;
-      } else if (_signature != signature) {
-        _signature = signature;
-        _stableSince = now;
+      bool stable;
+      String waitingMessage;
+
+      if (attribute != null) {
+        final sample = RenderedImageReadinessSample.decode(data);
+        stable = _imageStability.observe(sample, now);
+        waitingMessage =
+            '画像を準備しています… '
+            '${sample.validCount} / ${sample.count}件のURLを確認';
+      } else {
+        // 作品一覧など、従来の取得条件は変更しない。
+        final signature = '${data['url']}|$count|${data['size']}';
+
+        if (data['ready'] != 'complete' || count == 0) {
+          _signature = null;
+          _stableSince = null;
+        } else if (_signature != signature) {
+          _signature = signature;
+          _stableSince = now;
+        }
+
+        stable =
+            _stableSince != null &&
+            now.difference(_stableSince!) >= const Duration(seconds: 2);
+
+        waitingMessage = '$count件一致／一覧の安定を待っています';
       }
 
-      if (_auto &&
-          _stableSince != null &&
-          now.difference(_stableSince!) >= const Duration(seconds: 2)) {
+      if (_auto && stable) {
         await _capture();
         return;
       }
@@ -187,24 +224,27 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
       if (_auto && now.difference(_started) > const Duration(seconds: 30)) {
         setState(() {
           _auto = false;
-          _status =
-              '自動待機の上限に達しました。'
-              '必要なボタンを操作し、一覧を確認してから取得してください。'
-              ' 現在$count件一致';
+          _status = attribute == null
+              ? '自動待機の上限に達しました。'
+                    '必要なボタンを操作し、一覧を確認してから取得してください。'
+                    ' 現在$count件一致'
+              : '画像URLの準備が30秒以内に完了しませんでした。'
+                    '「自動取得を再試行」を押すか、'
+                    'ページを表示して状態を確認してください。'
+                    ' 現在$count件一致';
         });
         return;
       }
 
       setState(() {
-        _status = _auto
-            ? '$count件一致／一覧の安定を待っています'
-            : '$count件一致／表示を確認して「このページから取得」を押してください';
+        // 停止理由・エラーを件数表示で上書きしない。
+        if (_auto) _status = waitingMessage;
       });
     } catch (error) {
       if (mounted && !_finished && generation == _generation) {
         setState(() {
           _auto = false;
-          _status = '一覧を確認できませんでした：$error';
+          _status = '取得対象を確認できませんでした：$error';
         });
       }
     } finally {
@@ -312,6 +352,24 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
                   fit: StackFit.expand,
                   children: [
                     const ColoredBox(color: Colors.black),
+                    if (waiting)
+                      const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 32,
+                              height: 32,
+                              child: CircularProgressIndicator(),
+                            ),
+                            SizedBox(height: 16),
+                            Text(
+                              '画像を準備しています…',
+                              style: TextStyle(color: Colors.white70),
+                            ),
+                          ],
+                        ),
+                      ),
                     if (_silentControls || !waiting)
                       const SafeArea(
                         child: Align(
@@ -464,10 +522,13 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
               children: [
                 Text(_status),
                 const SizedBox(height: 6),
-                const Text(
-                  '自動取得は件数・HTMLサイズの安定で判断します。'
-                  'ボタン操作が必要なら自動取得をOFFにしてください。',
-                  style: TextStyle(color: Colors.white60, fontSize: 12),
+                Text(
+                  widget.imageAttribute == null
+                      ? '自動取得は件数・HTMLサイズの安定で判断します。'
+                            'ボタン操作が必要なら自動取得をOFFにしてください。'
+                      : '自動取得は本文画像URLの件数・順序・内容の安定で判断します。'
+                            'ボタン操作が必要なら自動取得をOFFにしてください。',
+                  style: const TextStyle(color: Colors.white60, fontSize: 12),
                 ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
@@ -540,6 +601,12 @@ class _RenderedRulePageState extends State<RenderedRulePage> {
                       });
                     },
                     onReceivedError: (controller, request, error) {
+                      if (widget.imageAttribute != null &&
+                          error.type ==
+                              WebResourceErrorType.CONNECTION_ABORTED &&
+                          _count > 0) {
+                        return;
+                      }
                       if (request.isForMainFrame == true &&
                           mounted &&
                           !_finished) {

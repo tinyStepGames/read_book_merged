@@ -26,6 +26,7 @@ dependencies:
   file_saver: 0.4.0
   super_clipboard: 0.9.1
   mobile_scanner: 7.5.0
+  image_picker: 1.2.1
   media_kit: 1.2.6
   media_kit_video: 2.0.1
   media_kit_libs_video: 1.0.7
